@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
 OWNER = "tahliaparker"
-SOURCE_REPO = "window-consultant"
+SOURCE_REPO = "window-consultant-cloudflare"
 
 SITE_NAME = "Window Consultant"
 SITE_DESCRIPTION = (
