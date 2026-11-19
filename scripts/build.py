@@ -2,6 +2,7 @@ import json
 import html
 import re
 import os
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -17,7 +18,6 @@ SITE_DESCRIPTION = (
 
 OUTPUT = Path("dist")
 POSTS = OUTPUT / "posts"
-
 TOKEN = os.environ.get("GH_TOKEN", "")
 
 
@@ -68,22 +68,178 @@ def slugify(text):
     return text.strip("-")[:65] or "article"
 
 
-def format_content(text):
-    text = html.escape(text or "")
+class ContentRenderer(HTMLParser):
+    ALLOWED = {
+        "p", "h2", "h3", "h4", "strong", "b",
+        "em", "i", "ul", "ol", "li",
+        "blockquote", "a", "img", "br",
+    }
 
-    text = re.sub(
-        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
-        lambda match: (
-            '<a href="'
-            + html.escape(match.group(2), quote=True)
-            + '" rel="noopener noreferrer">'
-            + match.group(1)
-            + "</a>"
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.stack = []
+        self.suppressed = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "iframe", "svg"):
+            self.suppressed += 1
+            return
+
+        if self.suppressed:
+            return
+
+        if tag not in self.ALLOWED:
+            return
+
+        attributes = dict(attrs)
+
+        if tag == "a":
+            href = html.unescape(
+                attributes.get("href") or ""
+            ).strip()
+
+            if not re.match(r"^https?://", href, re.I):
+                href = ""
+
+            if href:
+                self.parts.append(
+                    '<a href="'
+                    + html.escape(href, quote=True)
+                    + '" rel="noopener noreferrer">'
+                )
+                self.stack.append("a")
+            else:
+                self.stack.append(None)
+            return
+
+        if tag == "img":
+            src = html.unescape(
+                attributes.get("src") or ""
+            ).strip()
+
+            if re.match(r"^https?://", src, re.I):
+                alt = attributes.get("alt") or ""
+                self.parts.append(
+                    '<img src="'
+                    + html.escape(src, quote=True)
+                    + '" alt="'
+                    + html.escape(alt, quote=True)
+                    + '" loading="lazy">'
+                )
+            return
+
+        if tag == "br":
+            self.parts.append("<br>")
+            return
+
+        self.parts.append(f"<{tag}>")
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "iframe", "svg"):
+            self.suppressed = max(0, self.suppressed - 1)
+            return
+
+        if self.suppressed:
+            return
+
+        if tag not in self.ALLOWED or tag in ("img", "br"):
+            return
+
+        if not self.stack:
+            return
+
+        if tag in self.stack:
+            while self.stack:
+                opened = self.stack.pop()
+                if opened:
+                    self.parts.append(f"</{opened}>")
+                if opened == tag:
+                    break
+
+    def handle_data(self, data):
+        if not self.suppressed:
+            self.parts.append(html.escape(data))
+
+    def result(self):
+        while self.stack:
+            tag = self.stack.pop()
+            if tag:
+                self.parts.append(f"</{tag}>")
+        return "".join(self.parts)
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.suppressed = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.suppressed += 1
+        elif not self.suppressed and tag in (
+            "p", "div", "h1", "h2", "h3", "li", "br"
+        ):
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.suppressed = max(0, self.suppressed - 1)
+
+    def handle_data(self, data):
+        if not self.suppressed:
+            self.parts.append(data)
+
+    def result(self):
+        return re.sub(
+            r"\s+", " ", " ".join(self.parts)
+        ).strip()
+
+
+def plain_text(content):
+    parser = TextExtractor()
+    parser.feed(content or "")
+    return parser.result()
+
+
+def format_content(content):
+    content = content or ""
+
+    # HTML from RSS or GitHub Issues
+    if re.search(r"<(?:p|div|h[1-6]|img|ul|ol|br)\b", content, re.I):
+        parser = ContentRenderer()
+        parser.feed(content)
+        return parser.result()
+
+    # Markdown images
+    content = re.sub(
+        r"!\[([^\]]*)\]\((https?://[^\s)]+)\)",
+        lambda m: (
+            '<img src="'
+            + html.escape(m.group(2), quote=True)
+            + '" alt="'
+            + html.escape(m.group(1), quote=True)
+            + '" loading="lazy">'
         ),
-        text,
+        html.escape(content, quote=False),
     )
 
-    paragraphs = re.split(r"\n\s*\n", text)
+    # Markdown links
+    content = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        lambda m: (
+            '<a href="'
+            + html.escape(m.group(2), quote=True)
+            + '" rel="noopener noreferrer">'
+            + m.group(1)
+            + "</a>"
+        ),
+        content,
+    )
+
+    paragraphs = re.split(r"\n\s*\n", content)
 
     return "\n".join(
         "<p>" + p.replace("\n", "<br>") + "</p>"
@@ -100,9 +256,7 @@ CSS = """
     --accent: #ad6650;
     --border: #e4e1dc;
 }
-* {
-    box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 body {
     margin: 0;
     background: var(--background);
@@ -110,9 +264,7 @@ body {
     font-family: Arial, Helvetica, sans-serif;
     line-height: 1.7;
 }
-a {
-    color: var(--accent);
-}
+a { color: var(--accent); }
 .topbar {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -251,8 +403,20 @@ a {
     font-size: 18px;
     overflow-wrap: anywhere;
 }
-.article-body p {
-    margin-bottom: 24px;
+.article-body p { margin-bottom: 24px; }
+.article-body img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 28px auto;
+}
+.article-body h2,
+.article-body h3 {
+    line-height: 1.3;
+    margin-top: 32px;
+}
+.article-body a {
+    overflow-wrap: anywhere;
 }
 .back {
     display: inline-block;
@@ -275,35 +439,21 @@ footer {
     font-size: 13px;
 }
 @media (max-width: 700px) {
-    .topbar-inner {
-        padding: 22px;
-    }
-    .topbar-label {
-        display: none;
-    }
+    .topbar-inner { padding: 22px; }
+    .topbar-label { display: none; }
     .intro {
         display: block;
         padding: 55px 22px;
     }
-    .intro h1 {
-        letter-spacing: -1.5px;
-    }
-    .content {
-        padding: 0 22px;
-    }
-    .article-grid {
-        grid-template-columns: 1fr;
-    }
-    .article-card {
-        padding: 28px;
-    }
+    .intro h1 { letter-spacing: -1.5px; }
+    .content { padding: 0 22px; }
+    .article-grid { grid-template-columns: 1fr; }
+    .article-card { padding: 28px; }
     .article-page {
         margin: 20px;
         padding: 28px;
     }
-    .footer-inner {
-        flex-direction: column;
-    }
+    .footer-inner { flex-direction: column; }
 }
 """
 
@@ -350,9 +500,7 @@ def main():
         body = issue.get("body") or ""
         date = issue["created_at"][:10]
 
-        filename = (
-            f'{issue["number"]}-{slugify(title)}.html'
-        )
+        filename = f'{issue["number"]}-{slugify(title)}.html'
         active_files.add(filename)
         link = f"/posts/{filename}"
 
@@ -368,12 +516,14 @@ def main():
 </main>
 """
 
+        description = plain_text(body)[:155]
+
         (POSTS / filename).write_text(
-            template(title, article, body[:155]),
+            template(title, article, description),
             encoding="utf-8",
         )
 
-        summary = re.sub(r"\s+", " ", body).strip()
+        summary = plain_text(body)
         excerpt = html.escape(summary[:165])
 
         if len(summary) > 165:
@@ -431,9 +581,7 @@ def main():
         encoding="utf-8",
     )
 
-    print(
-        f"Cloudflare build complete: {len(issues)} articles."
-    )
+    print(f"Cloudflare build complete: {len(issues)} articles.")
 
 
 if __name__ == "__main__":
